@@ -6,24 +6,24 @@ use tokio::{
 };
 
 #[derive(Clone)]
-struct RPC<Request, Reply> {
-    server: mpsc::Sender<Callback<Request, Reply>>,
+struct Dispatcher<Request, Reply> {
+    server: mpsc::Sender<Message<Request, Reply>>,
 }
 
-impl<Request, Reply> RPC<Request, Reply>
+impl<Request, Reply> Dispatcher<Request, Reply>
 where
     Request: std::fmt::Debug + 'static,
     Reply: std::fmt::Debug + 'static,
 {
-    fn new(buffer: usize) -> (Self, mpsc::Receiver<Callback<Request, Reply>>) {
-        let (stx, srx) = mpsc::channel::<Callback<Request, Reply>>(buffer);
+    fn new(buffer: usize) -> (Self, mpsc::Receiver<Message<Request, Reply>>) {
+        let (stx, srx) = mpsc::channel::<Message<Request, Reply>>(buffer);
 
         (Self { server: stx }, srx)
     }
 
-    async fn request(&self, req: Request) -> Result<Reply, Box<dyn std::error::Error>> {
+    async fn send(&self, req: Request) -> Result<Reply, Box<dyn std::error::Error>> {
         let (tx, rx) = oneshot::channel::<Reply>();
-        let r = Callback {
+        let r = Message {
             data:  req,
             reply: tx,
         };
@@ -34,74 +34,75 @@ where
 }
 
 #[derive(Debug)]
-struct Callback<Request, Reply> {
+struct Message<Request, Reply> {
     data:  Request,
     reply: oneshot::Sender<Reply>,
 }
 
-type MyCallback = Callback<i32, i32>;
+type MyMessage = Message<i32, i32>;
 
-struct Processor {
-    srv:     mpsc::Receiver<MyCallback>,
+struct MyProcessor {
+    done:    bool,
+    queue:   mpsc::Receiver<MyMessage>,
     timer:   time::Interval,
     signals: Signal,
 }
 
-impl Processor {
+impl MyProcessor {
     async fn ctrl_c(&self) {
-        println!("S ^C :D  !");
+        println!("   S Seen ^C!");
     }
 
     async fn tick(&self) {
-        println!("S Tick!");
+        println!("   S Tick!");
     }
 
-    async fn process(&self, msg: Option<Callback<i32, i32>>) -> bool {
+    async fn process(&mut self, msg: Option<Message<i32, i32>>) {
         match msg {
             None => {
-                println!("S Close");
-                true
+                println!("   S Close");
+                self.done = true
             }
             Some(i) => {
                 let res = i.data * 2;
-                println!("S got = {}, reply = {}", i.data, res);
+                println!("   S got = {}, reply = {}", i.data, res);
                 i.reply.send(res).unwrap();
-                false
             }
         }
     }
 
     async fn serve(mut self) {
-        loop {
+        while !self.done {
             select! {
                _ = self.signals.recv() => { self.ctrl_c().await; }
                _ = self.timer.tick() => { self.tick().await; }
-               rcv = self.srv.recv() => { if self.process(rcv).await { break; } }
+               msg = self.queue.recv() => { self.process(msg).await; }
             }
         }
     }
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 10)]
+#[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
     let t1;
 
     {
-        let (rpc, srv) = RPC::<i32, i32>::new(100);
+        let (dispatcher, req_queue) = Dispatcher::<i32, i32>::new(100);
 
-        let handler = Processor {
-            srv,
-            timer: time::interval(time::Duration::from_millis(300)),
+        let processor = MyProcessor {
+            done:    false,
+            queue:   req_queue,
+            timer:   time::interval(time::Duration::from_millis(300)),
             signals: signal(SignalKind::interrupt())?,
         };
 
-        t1 = task::spawn(handler.serve());
+        t1 = task::spawn(processor.serve());
 
         for i in 0 .. 10 {
             println!("C sent = {}", i);
-            let rep = rpc.request(i).await?;
-            time::sleep(time::Duration::from_secs(2)).await;
+            let rep = dispatcher.send(i).await?;
             println!("C got = {}", rep);
+            time::sleep(time::Duration::from_secs(2)).await;
         }
     }
 
